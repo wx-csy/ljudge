@@ -1,0 +1,27 @@
+global cycles;
+global counts;
+global results;
+
+probe process("/usr/local/bin/ljudge").function("*@/home/yakumo/*") {
+    counts[ppfunc()] ++;
+    cycles[ppfunc()] = get_cycles();
+}
+
+probe process("/usr/local/bin/ljudge").function("*@/home/yakumo/*").return {
+    results[ppfunc()] += get_cycles() - cycles[ppfunc()];
+}
+
+probe process("/usr/local/bin/lrun").function("*@/home/yakumo/*") {
+    counts[ppfunc()] ++;
+    cycles[ppfunc()] = get_cycles();
+}
+
+probe process("/usr/local/bin/lrun").function("*@/home/yakumo/*").return {
+    results[ppfunc()] += get_cycles() - cycles[ppfunc()];
+}
+
+probe end {
+    foreach (i in counts+) {
+        printf("%-30s %-20d %-20d\n", i, counts[i], results[i]);
+    }
+}

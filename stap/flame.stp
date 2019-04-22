@@ -1,0 +1,26 @@
+global s;
+
+function progenyof(pid:long) {
+    parent = task_parent(task_current());
+    task = pid2task(pid);
+
+    while(parent && task_pid(parent) > 0) {
+        if(task == parent)
+            return 1;
+
+        parent = task_parent(parent);
+    }
+}
+
+probe timer.profile {
+    if (progenyof(target())) {
+        s[ubacktrace()] <<< 1;
+    }
+}
+
+probe end {
+    foreach (i in s+) {
+        print_ustack(i);
+        printf("\t%d\n", @count(s[i]));
+    }
+}

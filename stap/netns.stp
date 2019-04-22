@@ -1,0 +1,19 @@
+global starts;
+global results;
+global counts;
+
+probe kernel.function("*net_ns*") {
+
+    starts[ppfunc()] = get_cycles();
+    counts[ppfunc()] ++;
+}
+
+probe kernel.function("*net_ns*").return {
+    results[ppfunc()] += get_cycles() - starts[ppfunc()];
+}
+
+probe end {
+    foreach (i in results+) {
+        printf("%-30s %-20d %-20d\n", i, counts[i], results[i]);
+    }
+}
