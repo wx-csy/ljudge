@@ -148,6 +148,7 @@ struct Options {
   int nthread;  // how many testcases can run in parallel. default is decided by omp (cpu cores
   bool skip_on_first_failure;  // skip test cases after first failure occured
   double total_time_limit;  // seconds
+  bool ignore_presentation_error;
 };
 
 struct LrunArgs : public vector<string> {
@@ -722,6 +723,7 @@ static void print_usage() {
       "         [--threads n]\n"
 #endif
       "         [--skip-on-first-failure]\n"
+      "         [--ignore-presentation-error]\n"
       "         [--total-time-limit seconds]\n"
       "         [--max-cpu-time seconds] [--max-real-time seconds]\n"
       "         [--max-memory bytes] [--max-output bytes] [--max-stack bytes]\n"
@@ -1268,6 +1270,7 @@ static Options parse_cli_options(int argc, const char *argv[]) {
     options.direct_mode = false;
     options.nthread = 0;
     options.skip_on_first_failure = false;
+    options.ignore_presentation_error = false;
     options.total_time_limit = -1.0;
     current_case.checker_limit = { 5, 10, 1 << 30, 1 << 30, 1 << 30 };
     current_case.runtime_limit = { 1, 3, 1 << 26 /* 64M mem */, 1 << 25 /* 32M output */, 1 << 23 /* 8M stack limit */ };
@@ -1439,6 +1442,8 @@ static Options parse_cli_options(int argc, const char *argv[]) {
       }
       options.nthread = 1;
       options.skip_on_first_failure = true;
+    } else if (option == "ignore-presentation-error") {
+      options.ignore_presentation_error = true;
     } else if (option == "total-time-limit") {
       REQUIRE_NARGV(1);
       options.total_time_limit = NEXT_NUMBER_ARG;
@@ -2066,7 +2071,7 @@ static void run_custom_checker(j::object& result, const string& etc_dir, const s
   result["result"] = j::value(status);
 }
 
-static j::object run_testcase(const string& etc_dir, const string& cache_dir, const string& code_path, const string& checker_code_path, const map<string, string>& envs, const Testcase& testcase, bool skip_checker = false, bool keep_stdout = false, bool keep_stderr = false) {
+static j::object run_testcase(const string& etc_dir, const string& cache_dir, const string& code_path, const string& checker_code_path, const map<string, string>& envs, const Testcase& testcase, bool skip_checker = false, bool keep_stdout = false, bool keep_stderr = false, bool ignore_presentation_error = false) {
   log_debug("run_testcase: %s", testcase.input_path.c_str());
 
   // assume user code and checker code are pre-compiled
@@ -2142,6 +2147,11 @@ static j::object run_testcase(const string& etc_dir, const string& cache_dir, co
         run_custom_checker(result, etc_dir, cache_dir, code_path, checker_code_path, envs, testcase, stdout_path);
       }
     }
+
+    // check ignore presentation error
+    if(ignore_presentation_error && result["result"] ==  j::value(TestcaseResult::PRESENTATION_ERROR)){
+        result["result"] = j::value(TestcaseResult::ACCEPTED);
+    }
   } while (false);
 
   return result;
@@ -2158,7 +2168,7 @@ static j::value run_testcases(const Options& opts) {
   if (opts.total_time_limit > 0 || opts.skip_on_first_failure) {
     double totalTime = 0;
     for (int i = 0; i < (int)opts.cases.size(); ++i) {
-      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr);
+      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr, opts.ignore_presentation_error);
       results[i] = j::value(testcase_result);
       if (!testcase_result["time"].is<j::null>()) {
         totalTime += testcase_result["time"].get<double>();
@@ -2185,7 +2195,7 @@ static j::value run_testcases(const Options& opts) {
     #pragma omp parallel for if (opts.nthread != 1 && opts.cases.size() > 1)
 #endif
     for (int i = 0; i < (int)opts.cases.size(); ++i) {
-      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr);
+      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr, opts.ignore_presentation_error);
       results[i] = j::value(testcase_result);
     }
   }
