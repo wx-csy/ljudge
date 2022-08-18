@@ -59,6 +59,7 @@ namespace j = picojson;
 // sub-directory names in cache_dir
 #define SUBDIR_USER_CODE "code"
 #define SUBDIR_CHECKER "checker"
+#define SUBDIR_INTERACTOR "interactor"
 #define SUBDIR_TEMP "tmp"
 #define SUBDIR_KERNEL_CONFIG_CACHE "kconfig"
 
@@ -130,6 +131,7 @@ struct Testcase {
   string user_stderr_path;
   Limit runtime_limit;
   Limit checker_limit;
+  Limit interactor_limit;
 };
 
 struct Options {
@@ -137,6 +139,7 @@ struct Options {
   string cache_dir;
   string user_code_path;
   string checker_code_path;
+  string interactor_code_path;
   Limit compiler_limit;
   vector<Testcase> cases;
   map<string, string> envs;
@@ -251,7 +254,8 @@ protected:
     if (has_lrun_empty_netns()) return true;
     if (!fs::exists("/dev/shm/ljudge-netns-attempted")) {
       log_debug("running 'lrun-netns-empty create' to create empty netns");
-      system("lrun-netns-empty create 1>" DEV_NULL " 2>" DEV_NULL);
+      int ret = system("lrun-netns-empty create 1>" DEV_NULL " 2>" DEV_NULL);
+      if (ret != 0) log_debug("run 'lrun-netns-empty create' failed");
       fs::touch("/dev/shm/ljudge-netns-attempted");
       return has_lrun_empty_netns();
     } else {
@@ -702,7 +706,8 @@ static void print_usage() {
   fprintf(stderr,
       "Compile, run, judge and print response JSON:\n"
       "  ljudge --user-code (or -u) user-code-path\n"
-      "         [--checker-code (or -c) checker-code-path\n"
+      "         [--checker-code] (or -c) checker-code-path\n"
+      "         [--interactor-code] (or -a) interactor-code-path\n"
       "         [--testcase] --input (or -i) input-path --output (or -o) output-path\n"
       "         (or: --input input-path --output-sha1 ac-chomp-sha1,pe-sha1)\n"
       "         [--user-stdout path] [--user-stderr path]\n"
@@ -731,6 +736,8 @@ static void print_usage() {
       "         [--max-checker-memory bytes] [--max-checker-output bytes]\n"
       "         [--max-compiler-cpu-time seconds] [--max-compiler-real-time seconds]\n"
       "         [--max-compiler-memory bytes] [--max-compiler-output bytes]\n"
+      "         [--max-interactor-cpu-time seconds] [--max-interactor-real-time seconds]\n"
+      "         [--max-interactor-memory bytes] [--max-interactor-output bytes]\n"
       "         [--env name value] [--env name value] ...\n"
       "\n"
       "Check environment:\n"
@@ -1273,6 +1280,7 @@ static Options parse_cli_options(int argc, const char *argv[]) {
     options.ignore_presentation_error = false;
     options.total_time_limit = -1.0;
     current_case.checker_limit = { 5, 10, 1 << 30, 1 << 30, 1 << 30 };
+    current_case.interactor_limit = { 5, 10, 1 << 30, 1 << 30, 1 << 30 };
     current_case.runtime_limit = { 1, 3, 1 << 26 /* 64M mem */, 1 << 25 /* 32M output */, 1 << 23 /* 8M stack limit */ };
     debug_level = getenv("DEBUG") ? 10 : 0;
   }
@@ -1313,6 +1321,10 @@ static Options parse_cli_options(int argc, const char *argv[]) {
     } else if (option == "checker-code" || option == "c") {
       REQUIRE_NARGV(1);
       options.checker_code_path = NEXT_STRING_ARG;
+    } else if (option == "interactor-code" || option == "a") {
+      REQUIRE_NARGV(1);
+      options.interactor_code_path = NEXT_STRING_ARG;
+
     } else if (option == "testcase") {
       APPEND_TEST_CASE;
     } else if (option == "env") {
@@ -1398,6 +1410,18 @@ static Options parse_cli_options(int argc, const char *argv[]) {
     } else if (option == "max-checker-memory") {
       REQUIRE_NARGV(1);
       current_case.checker_limit.memory = parse_bytes(NEXT_STRING_ARG);
+    } else if (option == "max-interactor-cpu-time") {
+      REQUIRE_NARGV(1);
+      current_case.interactor_limit.cpu_time = NEXT_NUMBER_ARG;
+    } else if (option == "max-interactor-real-time") {
+      REQUIRE_NARGV(1);
+      current_case.interactor_limit.real_time = NEXT_NUMBER_ARG;
+    } else if (option == "max-interactor-output") {
+      REQUIRE_NARGV(1);
+      current_case.interactor_limit.output = parse_bytes(NEXT_STRING_ARG);
+    } else if (option == "max-interactor-memory") {
+      REQUIRE_NARGV(1);
+      current_case.interactor_limit.memory = parse_bytes(NEXT_STRING_ARG);
     /* [[[end]]] */
     } else if (option == "etc-dir") {
       REQUIRE_NARGV(1);
@@ -1438,7 +1462,7 @@ static Options parse_cli_options(int argc, const char *argv[]) {
 #endif
     } else if (option == "skip-on-first-failure") {
       if (options.nthread > 1) {
-        fatal("'skip-on-first-faiulure' does not work with threads")
+        fatal("'skip-on-first-faiulure' does not work with threads");
       }
       options.nthread = 1;
       options.skip_on_first_failure = true;
@@ -1615,6 +1639,163 @@ static void prepare_crash_report_path() {
 }
 #endif
 
+struct LrunParams {
+  vector<string> args;
+  string stdin_path;
+  string stdout_path;
+  string stderr_path;
+};
+
+static vector<LrunResult> batch_lrun(
+    const vector<LrunParams>& params
+) {
+  vector<int *> pipes(params.size());
+  vector<LrunResult> results(params.size());
+  for (uint i = 0; i < params.size(); i++) {
+    pipes[i] = new int[2];
+    results[i] = LrunResult();
+    int ret = pipe(pipes[i]);
+    if (ret != 0) fatal("can not create pipe to run lrun");
+  }
+#ifndef NDEBUG
+  for (uint i = 0; i < params.size(); i++) {
+    vector<string> args = params[i].args;
+    string stdin_path = params[i].stdin_path;
+    string stdout_path = params[i].stdout_path;
+    string stderr_path = params[i].stderr_path;
+    if (getenv("LJUDGE_SET_LRUN_SEGFAULT_PATH")) {
+      prepare_crash_report_path();
+    }
+    string debug_lrun_command = "lrun";
+    for (__typeof(args.begin()) it = args.begin(); it != args.end(); ++it) {
+        debug_lrun_command += " " + shell_escape(*it);
+    }
+    if (!stdin_path.empty()) debug_lrun_command += " <" + shell_escape(stdin_path);
+    if (!stdout_path.empty()) debug_lrun_command += " >" + shell_escape(stdout_path);
+    if (!stderr_path.empty()) {
+      if (stderr_path == stdout_path)
+        debug_lrun_command += " 2>&1";
+      else
+        debug_lrun_command += " 2>" + shell_escape(stderr_path);
+    }
+    log_debug("running: %s", debug_lrun_command.c_str());
+    fflush(stderr);
+    if (getenv("LJUDGE_KEEP_LRUN_STDERR") && stderr_path == DEV_NULL) {
+      stderr_path = format("/tmp/ljudge_lrun.%s.log", get_random_hash(6));
+      log_debug("lrun stderr redirects to %s", stderr_path.c_str());
+    }
+  }
+#endif
+  // pause();
+  vector<pid_t> pids(params.size());
+  for (uint i = 0; i < params.size(); i++) {
+    pid_t pid = fork();
+    pids[i] = pid;
+    if (pid == -1) {
+      log_debug("failed to fork\n");
+      results[i].error = "cannot fork to run lrun";
+    }
+    if (0 == pid) {
+      vector<string> args = params[i].args;
+      string stdin_path = params[i].stdin_path;
+      string stdout_path = params[i].stdout_path;
+      string stderr_path = params[i].stderr_path;
+      prctl(PR_SET_PDEATHSIG, SIGTERM);
+      close(pipes[i][0]);
+      // pass lrun's fd (3) output
+      static const int LRUN_FILENO = 3;
+      setfd(LRUN_FILENO, pipes[i][1]);
+      // prepare fds
+      if (!stdin_path.empty()) {
+        fclose(stdin);
+        int ret = open(stdin_path.c_str(), O_RDONLY | O_NONBLOCK);
+        if (ret < 0) fatal("can not open %s for reading", stdin_path.c_str());
+        // reset to blocking
+        int opts = fcntl(ret, F_GETFL);
+        opts = opts & (~O_NONBLOCK);
+        fcntl(ret, F_SETFL, opts);
+        setfd(STDIN_FILENO, ret);
+      }
+      if (!stderr_path.empty()) {
+        fclose(stderr);
+        int ret = open(stderr_path.c_str(), O_WRONLY | O_TRUNC | O_CREAT, 0600);
+        if (ret < 0) fatal("can not open %s for writing", stderr_path.c_str());
+        setfd(STDERR_FILENO, ret);
+      }
+      if (!stdout_path.empty()) {
+        fclose(stdout);
+        if (stderr_path == stdout_path) {
+          dup2(STDERR_FILENO, STDOUT_FILENO);
+        } else {
+          int ret = open(stdout_path.c_str(), O_WRONLY | O_TRUNC | O_CREAT, 0600);
+          if (ret < 0) fatal("can not open %s for writing", stdout_path.c_str());
+          setfd(STDOUT_FILENO, ret);
+        }
+      }
+      // prepare args
+      const char **argv = (const char**)malloc(sizeof(char*) * (args.size() + 2));
+      argv[0] = "lrun";
+      for (int i = 0; i < (int)args.size(); ++i) {
+        argv[i + 1] = args[i].c_str();
+      }
+      argv[args.size() + 1] = 0;
+      execvp("lrun", (char * const *) argv);
+      close(pipes[i][1]);
+      log_error("can not start lrun");
+      // not using cleanup_exit here because it is the child
+      exit(1);
+    }
+  }
+  for (uint i = 0; i < params.size(); i++) {
+    if (pids[i] == -1) {
+      continue;
+    }
+    close(pipes[i][1]);
+
+    int status = 0;
+    string lrun_output = "";
+
+    while (true) {
+      char ch;
+      ssize_t read_size = read(pipes[i][0], &ch, 1);
+      if (read_size == 1) {
+        lrun_output += ch;
+        if (ch == '\n' && lrun_output.find("EXCEED  ") != string::npos) {
+          // we receive enough content (EXCEED ... "\n" is the last line)
+          // lrun's exiting may take 0.03+ seconds (mostly the kernel
+          // cleaning up the pid and ipc namespace). do NOT wait for it.
+          //
+          // lrun ignores SIGPIPE so this won't hurt it.
+          //
+          // we will soon exit (after all testcases) so zombies will be
+          // killed by init.
+          //
+          // this reduces 0.03 to 0.04s per lrun run. when running
+          // examples/a-plus-b/run.sh, real time decreases from 14.27
+          // to 13.29, about 7%.
+          results[i] = parse_lrun_output(lrun_output);
+          break;
+        }
+      } else {
+        // EOF or error. get lrun exit status
+        while (waitpid(pids[i], &status, 0) != pids[i]) usleep(10000);
+        if (status && WIFSIGNALED(status)) {
+          results[i].error = format("lrun was signaled (%d)", WTERMSIG(status));
+        } else if (status && WEXITSTATUS(status) != 0) {
+          results[i].error = format("lrun exited with non-zero (%d)", WEXITSTATUS(status));
+        } else {
+          results[i].error = format("lrun did not generate expected output");
+        }
+        break;
+      }
+    }
+    close(pipes[i][0]);
+    delete[] pipes[i];
+    log_debug("lrun output:\n%s", lrun_output.c_str());
+  }
+  return results;
+}
+
 static LrunResult lrun(
 #ifdef NDEBUG
     const vector<string>& args, const string& stdin_path, const string& stdout_path, const string& stderr_path
@@ -1649,8 +1830,8 @@ static LrunResult lrun(
     stderr_path = format("/tmp/ljudge_lrun.%s.log", get_random_hash(6));
     log_debug("lrun stderr redirects to %s", stderr_path.c_str());
   }
+  
 #endif
-
   pid_t pid = fork();
   if (pid == -1) {
     log_debug("failed to fork\n");
@@ -2003,44 +2184,118 @@ static void prepare_checker_mount_bind_files(const string& dest) {
   fs::touch(fs::join(dest, "user_code"));
 }
 
-static void run_custom_checker(j::object& result, const string& etc_dir, const string& cache_dir, const string& code_path, const string& checker_code_path, const map<string, string>& envs, const Testcase& testcase, const string& user_output_path) {
-  log_debug("run_custom_checker: %s %s", testcase.output_path.c_str(), user_output_path.c_str());
+static void prepare_inteactor_bind_files(const string& dest) {
+  fs::touch(fs::join(dest, "input"));
+  fs::touch(fs::join(dest, "output"));
+  fs::touch(fs::join(dest, "answer"));
+}
 
-  // prepare check environment
-  // to be compatible with legacy checkers:
-  // - a file named "output" is standard output
-  // - a file named argv[1] is user output file path
-  // - stdin is standard input
+static std::pair<LrunResult, LrunResult> run_code_with_inteactor(
+    const string& etc_dir,
+    const string& cache_dir,
+    const string& dest,
+    const string& code_path,
+    const Limit& limit,
+    const string& interactor_dest,
+    const string& interactor_path,
+    const Limit& interactor_limit,
+    const Testcase& testcase,
+    const string& stdin_path, // no use?
+    const string& stdout_path,
+    const string& stderr_path = DEV_NULL,
+    const vector<string>& extra_lrun_args = vector<string>(),
+    const string& env = ENV_RUN,
+    const vector<string>& extra_argv = vector<string>()
+) {
+  log_debug("run_code_with_interactor: %s", code_path.c_str());
 
+  vector<LrunParams> params;
 
-  // extra lrun args
-  LrunArgs lrun_args;
+  string user_chroot_path = prepare_chroot(etc_dir, code_path, env);
+  string user_exe_name = get_config_content(etc_dir, code_path, ENV_COMPILE EXT_EXE_NAME, DEFAULT_EXE_NAME);
 
-  lrun_args.append("--bindfs-ro", "$chroot/tmp/input", get_full_path(testcase.input_path));
-  lrun_args.append("--bindfs-ro", "$chroot/tmp/output", get_full_path(testcase.output_path));
-  lrun_args.append("--bindfs-ro", "$chroot/tmp/user_output", get_full_path(user_output_path));
-  lrun_args.append("--bindfs-ro", "$chroot/tmp/user_code", get_full_path(code_path));
+  string i2u_pipe = fs::join(cache_dir, format("%s-%s", "i2u", get_random_hash()));
+  string u2i_pipe = fs::join(cache_dir, format("%s-%s", "i2u", get_random_hash()));
 
-  for (__typeof(envs.begin()) it = envs.begin(); it != envs.end(); ++it) {
-      lrun_args.append("--env", it->first, it->second);
-  }
-
-  // run checker
-  string checker_output;
-  LrunResult lrun_result;
   {
-    string output_path = get_temp_file_path(cache_dir, "checker-out");
-    // should flock output_path, but since we use different tmp path, and it is scoped in pid dir. no more necessary
-    // the checker needs argv[1], which is "user_output"
-    vector<string> checker_argv;
-    checker_argv.push_back("user_output");
+    // not locking here because the directory is read-only
+    // fs::ScopedFileLock lock(dest);
+    std::list<string> run_cmd = get_config_list(etc_dir, code_path, ENV_RUN EXT_CMD_LIST);
+    if (run_cmd.empty()) {
+      // use exe name as fallback
+      run_cmd.push_back("./" + user_exe_name);
+    }
 
-    // dest must be the same as the dest used for compile_code
-    string dest = get_code_work_dir(fs::join(cache_dir, SUBDIR_CHECKER), checker_code_path);
-    lrun_result = run_code(etc_dir, cache_dir, dest, checker_code_path, testcase.checker_limit, testcase.input_path, output_path, DEV_NULL /* stderr */, lrun_args, ENV_CHECK, checker_argv);
-    checker_output = fs::nread(output_path, TRUNC_LOG);
+    if (mkfifo(i2u_pipe.c_str(), 0666) < 0) fatal("cannot create named pipe for interactor %s, %d", i2u_pipe.c_str(), errno);
+    if (mkfifo(u2i_pipe.c_str(), 0666) < 0) fatal("cannot create named pipe for interactor %s, %d", u2i_pipe.c_str(), errno);
+
+    string src_name = get_src_name(etc_dir, code_path);
+    map<string, string> mappings = get_mappings(src_name, user_exe_name, dest);
+    mappings["$chroot"] = user_chroot_path;
+
+    LrunArgs lrun_args;
+    lrun_args.append_default();
+    lrun_args.append("--chroot", user_chroot_path);
+    lrun_args.append("--bindfs-ro", fs::join(user_chroot_path, "/tmp"), dest);
+    lrun_args.append(get_override_lrun_args(etc_dir, cache_dir, code_path, ENV_RUN, user_chroot_path, run_cmd.size() >= 2 ? (*run_cmd.begin()) : "" ));
+    lrun_args.append(limit);
+    lrun_args.append(escape_list(extra_lrun_args, mappings));
+    lrun_args.append(filter_user_lrun_args(escape_list(get_config_list(etc_dir, code_path, format("%s%s", env, EXT_LRUN_ARGS)), mappings), cache_dir));
+    lrun_args.append(filter_user_lrun_args(escape_list(get_config_list(etc_dir, code_path, ENV_EXTRA EXT_LRUN_ARGS), mappings), cache_dir));
+    lrun_args.append("--");
+    lrun_args.append(escape_list(run_cmd, mappings));
+    lrun_args.append(escape_list(extra_argv, mappings));
+
+    LrunParams user_p = LrunParams{lrun_args, i2u_pipe, u2i_pipe, stderr_path};
+    params.push_back(user_p);
   }
 
+  string interactor_chroot_path = prepare_chroot(etc_dir, interactor_path, env);
+  string interactor_exe_name = get_config_content(etc_dir, interactor_path, ENV_COMPILE EXT_EXE_NAME, DEFAULT_EXE_NAME);
+
+  {
+    // not locking here because the directory is read-only
+    // fs::ScopedFileLock lock(dest);
+    std::list<string> run_cmd = get_config_list(etc_dir, interactor_path, ENV_RUN EXT_CMD_LIST);
+    if (run_cmd.empty()) {
+      // use exe name as fallback
+      run_cmd.push_back("./" + interactor_exe_name);
+    }
+
+    vector<string> interactor_argv;
+    interactor_argv.push_back("output");
+
+    string src_name = get_src_name(etc_dir, interactor_path);
+    map<string, string> mappings = get_mappings(src_name, interactor_exe_name, interactor_dest);
+    mappings["$chroot"] = interactor_chroot_path;
+
+    LrunArgs lrun_args;
+    lrun_args.append_default();
+    lrun_args.append("--chroot", interactor_chroot_path);
+    lrun_args.append("--bindfs-ro", fs::join(interactor_chroot_path, "/tmp"), interactor_dest);
+    lrun_args.append("--bindfs-ro", fs::join(interactor_chroot_path, "/tmp", "input"), get_full_path(testcase.input_path));
+    lrun_args.append("--bindfs", fs::join(interactor_chroot_path, "/tmp", "output"), stdout_path);
+    lrun_args.append("--bindfs-ro", fs::join(interactor_chroot_path, "/tmp", "answer"), get_full_path(testcase.output_path));
+    lrun_args.append(get_override_lrun_args(etc_dir, cache_dir, interactor_path, ENV_RUN, interactor_chroot_path, run_cmd.size() >= 2 ? (*run_cmd.begin()) : "" ));
+    lrun_args.append(interactor_limit);
+    lrun_args.append(escape_list(extra_lrun_args, mappings));
+    lrun_args.append(filter_user_lrun_args(escape_list(get_config_list(etc_dir, interactor_path, format("%s%s", env, EXT_LRUN_ARGS)), mappings), cache_dir));
+    lrun_args.append(filter_user_lrun_args(escape_list(get_config_list(etc_dir, interactor_path, ENV_EXTRA EXT_LRUN_ARGS), mappings), cache_dir));
+    lrun_args.append("--");
+    lrun_args.append(escape_list(run_cmd, mappings));
+    lrun_args.append(escape_list(interactor_argv, mappings));
+    lrun_args.append(escape_list(extra_argv, mappings));
+
+    // LrunResult ineractor_run_result = lrun(lrun_args, "user2interactor", "interactor2user", stderr_path);
+    LrunParams interactor_p = LrunParams{lrun_args, u2i_pipe, i2u_pipe, stderr_path};
+    params.push_back(interactor_p);
+  }
+
+  vector<LrunResult> results = batch_lrun(params);
+  return std::make_pair(results[0], results[1]);
+}
+
+static void handle_testlib_result(j::object& result, LrunResult& lrun_result, string& checker_output) {
   string status = TestcaseResult::INTERNAL_ERROR;
   string error_message;
   static const int CHECKER_EXITCODE_ACCEPTED = 0;
@@ -2071,7 +2326,74 @@ static void run_custom_checker(j::object& result, const string& etc_dir, const s
   result["result"] = j::value(status);
 }
 
-static j::object run_testcase(const string& etc_dir, const string& cache_dir, const string& code_path, const string& checker_code_path, const map<string, string>& envs, const Testcase& testcase, bool skip_checker = false, bool keep_stdout = false, bool keep_stderr = false, bool ignore_presentation_error = false) {
+static void run_custom_checker(j::object& result, const string& etc_dir, const string& cache_dir, const string& code_path, const string& checker_code_path, const map<string, string>& envs, const Testcase& testcase, const string& user_output_path) {
+  log_debug("run_custom_checker: %s %s", testcase.output_path.c_str(), user_output_path.c_str());
+
+  // prepare check environment
+  // to be compatible with legacy checkers:
+  // - a file named "output" is standard output
+  // - a file named argv[1] is user output file path
+  // - stdin is standard input
+
+
+  // extra lrun args
+  
+  LrunArgs lrun_args;
+  lrun_args.append("--bindfs-ro", "$chroot/tmp/input", get_full_path(testcase.input_path));
+  lrun_args.append("--bindfs-ro", "$chroot/tmp/output", get_full_path(testcase.output_path));
+  lrun_args.append("--bindfs-ro", "$chroot/tmp/user_output", get_full_path(user_output_path));
+  lrun_args.append("--bindfs-ro", "$chroot/tmp/user_code", get_full_path(code_path));
+
+  for (__typeof(envs.begin()) it = envs.begin(); it != envs.end(); ++it) {
+      lrun_args.append("--env", it->first, it->second);
+  }
+
+  // run checker
+  string checker_output;
+  LrunResult lrun_result;
+  {
+    string output_path = get_temp_file_path(cache_dir, "checker-out");
+    // should flock output_path, but since we use different tmp path, and it is scoped in pid dir. no more necessary
+    // the checker needs argv[1], which is "user_output"
+    vector<string> checker_argv;
+    checker_argv.push_back("user_output");
+
+    // dest must be the same as the dest used for compile_code
+    string dest = get_code_work_dir(fs::join(cache_dir, SUBDIR_CHECKER), checker_code_path);
+    lrun_result = run_code(etc_dir, cache_dir, dest, checker_code_path, testcase.checker_limit, testcase.input_path, output_path, output_path /* stderr */, lrun_args, ENV_CHECK, checker_argv);
+    checker_output = fs::nread(output_path, TRUNC_LOG);
+  }
+  string status = TestcaseResult::INTERNAL_ERROR;
+  string error_message;
+  static const int CHECKER_EXITCODE_ACCEPTED = 0;
+  static const int CHECKER_EXITCODE_WRONG_ANSWER = 1;
+  static const int CHECKER_EXITCODE_PRESENTATION_ERROR = 2;
+  // In most unix systems exit code is limited to 8 bits, -1 becomes 255
+  static const int LEGACY_CHECKER_EXITCODE_WRONG_ANSWER = 255;
+
+  if (!lrun_result.error.empty()) {
+    error_message = "lrun internal error: " + lrun_result.error;
+  } else if (!lrun_result.exceed.empty()) {
+    error_message = "checker exceeded " + lrun_result.exceed + " limit";
+  } else if (lrun_result.signaled) {
+    error_message = format("checker was killed by signal %d", lrun_result.term_sig);
+  } else if (lrun_result.exit_code == CHECKER_EXITCODE_ACCEPTED) {
+    status = TestcaseResult::ACCEPTED;
+  } else if (lrun_result.exit_code == CHECKER_EXITCODE_WRONG_ANSWER || lrun_result.exit_code == LEGACY_CHECKER_EXITCODE_WRONG_ANSWER) {
+    status = TestcaseResult::WRONG_ANSWER;
+  } else if (lrun_result.exit_code == CHECKER_EXITCODE_PRESENTATION_ERROR) {
+    status = TestcaseResult::PRESENTATION_ERROR;
+  } else {
+    error_message = format("unknown checker exit code %d", lrun_result.exit_code);
+  }
+
+  if (!checker_output.empty()) result["checkerOutput"] = j::value(checker_output);
+
+  if (!error_message.empty()) result["error"] = j::value(error_message);
+  result["result"] = j::value(status);
+}
+
+static j::object run_testcase(const string& etc_dir, const string& cache_dir, const string& code_path, const string& interactor_code_path, const string& checker_code_path, const map<string, string>& envs, const Testcase& testcase, bool skip_checker = false, bool keep_stdout = false, bool keep_stderr = false, bool ignore_presentation_error = false) {
   log_debug("run_testcase: %s", testcase.input_path.c_str());
 
   // assume user code and checker code are pre-compiled
@@ -2081,11 +2403,20 @@ static j::object run_testcase(const string& etc_dir, const string& cache_dir, co
   string stdout_path = testcase.user_stdout_path.empty() ? get_temp_file_path(cache_dir, "out") : testcase.user_stdout_path;
   string stderr_path = testcase.user_stderr_path.empty() ? (keep_stderr ? get_temp_file_path(cache_dir, "err") : DEV_NULL) : testcase.user_stderr_path;
   LrunResult run_result;
+  LrunResult interactor_result;
+  string interactor_output;
   do {
     // should flock stdout_path, but since we use different tmp path, and it is scoped in pid dir. no more necessary
     // dest must be the same with dest used in compile_code
     string dest = get_code_work_dir(get_process_tmp_dir(cache_dir), code_path);
-    run_result = run_code(etc_dir, cache_dir, dest, code_path, testcase.runtime_limit, testcase.input_path, stdout_path, stderr_path, vector<string>() /* extra_lrun_args */, ENV_RUN /* env */);
+    if(interactor_code_path.empty()) {
+      run_result = run_code(etc_dir, cache_dir, dest, code_path, testcase.runtime_limit, testcase.input_path, stdout_path, stderr_path, vector<string>() /* extra_lrun_args */, ENV_RUN /* env */);
+    } else {
+      string interactor_dest = get_code_work_dir(fs::join(cache_dir, SUBDIR_INTERACTOR), interactor_code_path);
+      // run with interactor
+      std::tie(run_result, interactor_result) = run_code_with_inteactor(etc_dir, cache_dir, dest, code_path, testcase.runtime_limit, interactor_dest, interactor_code_path, testcase.interactor_limit, testcase, testcase.input_path, stdout_path, stderr_path, vector<string>() /* extra_lrun_args */, ENV_RUN /* env */);
+      interactor_output = fs::nread(stdout_path, TRUNC_LOG);
+    }
 
     // write stdout, stderr
     if (keep_stdout) result["stdout"] = j::value(fs::nread(stdout_path, TRUNC_LOG));
@@ -2114,6 +2445,13 @@ static j::object run_testcase(const string& etc_dir, const string& cache_dir, co
       }
       result["exceed"] = j::value(exceed);
       break;
+    }
+
+    if(!interactor_code_path.empty()) {
+      handle_testlib_result(result, interactor_result, interactor_output);
+      if (interactor_result.exit_code != 0) {
+        break;
+      }
     }
 
     // check signaled and exit code
@@ -2166,16 +2504,16 @@ static j::value run_testcases(const Options& opts) {
   vector<j::value> results;
   results.resize(opts.cases.size());
   if (opts.total_time_limit > 0 || opts.skip_on_first_failure) {
-    double totalTime = 0;
+    double total_time = 0;
     for (int i = 0; i < (int)opts.cases.size(); ++i) {
-      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr, opts.ignore_presentation_error);
+      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.interactor_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr, opts.ignore_presentation_error);
       results[i] = j::value(testcase_result);
       if (!testcase_result["time"].is<j::null>()) {
-        totalTime += testcase_result["time"].get<double>();
+        total_time += testcase_result["time"].get<double>();
       }
 
       j::object skipped_result;
-      bool total_time_limit_exceed = opts.total_time_limit > 0 && totalTime > opts.total_time_limit;
+      bool total_time_limit_exceed = opts.total_time_limit > 0 && total_time > opts.total_time_limit;
       bool first_failure = opts.skip_on_first_failure && testcase_result["result"].to_str() != TestcaseResult::ACCEPTED;
       if (total_time_limit_exceed) {
         skipped_result["result"] = j::value(TestcaseResult::TOTAL_TIME_LIMIT_EXCEEDED);
@@ -2195,7 +2533,7 @@ static j::value run_testcases(const Options& opts) {
     #pragma omp parallel for if (opts.nthread != 1 && opts.cases.size() > 1)
 #endif
     for (int i = 0; i < (int)opts.cases.size(); ++i) {
-      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr, opts.ignore_presentation_error);
+      j::object testcase_result = run_testcase(opts.etc_dir, opts.cache_dir, opts.user_code_path, opts.interactor_code_path, opts.checker_code_path, opts.envs, opts.cases[i], opts.skip_checker, opts.keep_stdout, opts.keep_stderr, opts.ignore_presentation_error);
       results[i] = j::value(testcase_result);
     }
   }
@@ -2246,6 +2584,13 @@ int main(int argc, char const *argv[]) {
     if (!compile_result.success) compiled = false;
   }
 
+  if (compiled && !opts.interactor_code_path.empty()) { // precompile inteactor code
+    string dest = get_code_work_dir(fs::join(opts.cache_dir, SUBDIR_INTERACTOR), opts.interactor_code_path);
+    CompileResult compile_result = compile_code(opts.etc_dir, opts.cache_dir, dest, opts.interactor_code_path, opts.compiler_limit);
+    write_compile_result(jo, compile_result, "interactorCompilation");
+    if (!compile_result.success) compiled = false;
+    prepare_inteactor_bind_files(dest);
+  }
   if (compiled && !opts.checker_code_path.empty()) { // precompile checker code
     string dest = get_code_work_dir(fs::join(opts.cache_dir, SUBDIR_CHECKER), opts.checker_code_path);
     CompileResult compile_result = compile_code(opts.etc_dir, opts.cache_dir, dest, opts.checker_code_path, opts.compiler_limit);
