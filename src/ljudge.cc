@@ -1710,7 +1710,6 @@ static vector<LrunResult> batch_lrun(
         fclose(stdin);
         int ret = open(stdin_path.c_str(), O_RDONLY);
         if (ret < 0) fatal("can not open %s for reading", stdin_path.c_str());
-        fcntl(ret, F_SETFL, opts);
         setfd(STDIN_FILENO, ret);
       }
       if (!stderr_path.empty()) {
